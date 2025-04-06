@@ -15,6 +15,9 @@ import signal
 import json
 from flask import Flask, render_template_string, request, jsonify
 import flaschen_np
+import socket
+import qrcode
+import sys
 
 # Configuration
 HOST = '0.0.0.0'  # Listen on all interfaces
@@ -23,6 +26,7 @@ DISPLAY_WIDTH = 192
 DISPLAY_HEIGHT = 128
 DISPLAY_LAYER = 2        # Animation layer
 DISPLAY_TEXT_LAYER = 1   # Text layer (lower than animation)
+QR_CODE_LAYER = 2        # Layer for QR code
 FT_HOST = 'localhost'
 FT_PORT = 1337
 SETTINGS_FILE = 'matrix_settings.json'
@@ -488,11 +492,9 @@ def draw_text(text, color=(0, 255, 0), layer=None, clear_first=True):
     text_ft.send()
 
 def draw_welcome_text():
-    """Draw the welcome message with IP address using a single text call"""
-    ip_address = f"HTTP://{HOST}" if HOST != '0.0.0.0' else f"HTTP://192.168.86.56"
-    # Use a single draw_text call with a newline character
-    draw_text(f"PRESS START AT:\n{ip_address}", 
-              color=(0, 180, 0))  # Use same color for both lines
+    """Draw just the IP address (no welcome text)"""
+    # Show only the QR code with IP address - no welcome message
+    display_qr_code()
 
 def fill_screen(color, layer=None):
     """Fill the display with a single color"""
@@ -755,55 +757,169 @@ def update_text():
     
     return jsonify({"text": custom_text})
 
+@app.route('/qrcode', methods=['POST'])
+def qrcode_control():
+    """Show QR code on LED matrix"""
+    # Parse the request
+    data = request.json
+    action = data.get('action', '')
+    
+    if action == 'show':
+        # Display the QR code
+        url = display_qr_code()
+        
+        # Return the status
+        return jsonify({
+            "success": True,
+            "url": url
+        })
+    
+    return jsonify({
+        "success": False,
+        "error": "Invalid action"
+    })
+
 def signal_handler(sig, frame):
     """Handle SIGINT and SIGTERM signals"""
     stop_event.set()
     if matrix_process and matrix_process.poll() is None:
         matrix_process.terminate()
+        try:
+            matrix_process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            matrix_process.kill()
     print("\nShutting down web server...")
-    os._exit(0)
+    # Don't use os._exit as it doesn't allow cleanup
+    # Instead let the normal exit flow handle things
+    if sig == signal.SIGTERM:
+        sys.exit(0)
+
+def generate_qr_code(url):
+    """Generate a QR code for the given URL"""
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=1,
+        border=0,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+    
+    # Get the QR code matrix
+    matrix = qr.get_matrix()
+    return matrix
+
+def display_qr_code():
+    """Display a QR code for the web server URL on the LED matrix"""
+    # Define the simple 5x7 font for IP address display
+    font = {
+        '0': [0x3E, 0x45, 0x49, 0x51, 0x3E],
+        '1': [0x00, 0x21, 0x7F, 0x01, 0x00],
+        '2': [0x21, 0x43, 0x45, 0x49, 0x31],
+        '3': [0x22, 0x41, 0x49, 0x49, 0x36],
+        '4': [0x0C, 0x14, 0x24, 0x7F, 0x04],
+        '5': [0x72, 0x51, 0x51, 0x51, 0x4E],
+        '6': [0x1E, 0x29, 0x49, 0x49, 0x06],
+        '7': [0x40, 0x40, 0x47, 0x58, 0x60],
+        '8': [0x36, 0x49, 0x49, 0x49, 0x36],
+        '9': [0x30, 0x49, 0x49, 0x4A, 0x3C],
+        '.': [0x01, 0x01, 0x00, 0x00, 0x00],
+    }
+
+    # Use the actual IP address instead of the hostname lookup
+    ip_address = "192.168.86.56"
+    url = f"http://{ip_address}:{PORT}"
+    
+    # Generate the QR code
+    qr_matrix = generate_qr_code(url)
+    
+    # Create a new FlaschenNP instance for the QR code layer
+    qr_ft = flaschen_np.FlaschenNP(FT_HOST, FT_PORT, DISPLAY_WIDTH, DISPLAY_HEIGHT, layer=QR_CODE_LAYER)
+    qr_ft.zero()
+    
+    # Scale factor for the QR code (3x larger)
+    scale = 3
+    
+    # Calculate the size and position of the QR code
+    qr_size = len(qr_matrix)
+    scaled_size = qr_size * scale
+    start_x = (DISPLAY_WIDTH - scaled_size) // 2
+    # Position slightly higher to leave room for IP text
+    start_y = (DISPLAY_HEIGHT - scaled_size) // 2 + 10
+    
+    # Draw the QR code with scaling
+    for y in range(qr_size):
+        for x in range(qr_size):
+            color = (0, 0, 0) if qr_matrix[y][x] else (255, 255, 255)  # Black or white
+            # Draw each QR code pixel as a 3x3 square
+            for sy in range(scale):
+                for sx in range(scale):
+                    qr_ft.set(start_x + (x * scale) + sx, start_y + (y * scale) + sy, color)
+    
+    # Draw the IP address above the QR code
+    text = f"{ip_address}"
+    text_width = len(text) * 6
+    text_x = (DISPLAY_WIDTH - text_width) // 2
+    text_y = start_y - 15
+    
+    # Simple font rendering for the IP address only
+    for i, char in enumerate(text):
+        if char in font:
+            pattern = font[char]
+            for col in range(5):
+                bits = pattern[col]
+                for row in range(7):
+                    if bits & (1 << (6 - row)):
+                        qr_ft.set(text_x + i*6 + col, text_y + row, (0, 255, 0))
+    
+    # Send to display
+    qr_ft.send()
+    
+    # Return the URL that was encoded
+    return url
 
 if __name__ == '__main__':
-    # Set up signal handlers
+    # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGHUP, signal_handler)  # Handle terminal disconnect
     
     # Load settings from file
     load_settings()
     
-    # This ensures the welcome message is shown BEFORE any Flask initialization
-    print("Initializing display and showing welcome message...")
+    # Prepare log file
+    if not os.path.isdir('logs'):
+        os.makedirs('logs', exist_ok=True)
+    log_file = os.path.join('logs', 'matrix_web.log')
     
-    # Initialize both layers immediately
+    # Initialize display layers
     fill_screen((0, 0, 0))  # Clear animation layer
     fill_screen((0, 0, 0), layer=DISPLAY_TEXT_LAYER)  # Clear text layer
+    fill_screen((0, 0, 0), layer=QR_CODE_LAYER)  # Clear QR code layer
     
-    # Draw welcome text including time directly without any threading
-    ip_address = f"HTTP://{HOST}" if HOST != '0.0.0.0' else f"HTTP://192.168.86.56"
-    welcome_text = f"PRESS START AT:\n{ip_address}"
-    draw_text(welcome_text, color=(0, 180, 0))
+    # Display QR code at startup
+    print("Displaying QR code on LED matrix")
+    url = display_qr_code()
     
-    # Ensure text is visible by forcing the send
-    ft = flaschen_np.FlaschenNP(FT_HOST, FT_PORT, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_TEXT_LAYER)
-    ft.send()
+    # No additional welcome text, just display the QR code with IP
+    time.sleep(1)
     
-    # More time to ensure display update completes
-    time.sleep(2)
-    
-    # Wait for confirmation (if needed)
-    print("Welcome message displayed.")
+    print("QR code displayed.")
     
     # Set initial state
     animation_state = "Stopped"
     
-    # Start animation control thread AFTER welcome text is already displayed
+    # Start animation control thread
     animation_thread = threading.Thread(target=run_matrix_animation)
     animation_thread.daemon = True
     animation_thread.start()
     
-    # Wait a bit more to ensure the thread doesn't immediately overwrite our text
+    # Wait a bit more to ensure the thread doesn't immediately overwrite the QR code
     time.sleep(0.5)
     
-    # Start the web server
+    # Display server info
     print(f"Starting web server at http://192.168.86.56:{PORT}")
-    app.run(host=HOST, port=PORT, debug=False) 
+    print(f"This server will continue running even if the SSH session ends")
+    
+    # Run Flask app
+    app.run(host=HOST, port=PORT, debug=False, threaded=True) 

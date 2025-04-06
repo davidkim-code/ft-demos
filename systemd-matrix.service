@@ -1,0 +1,16 @@
+[Unit]
+Description=Matrix Web Controller Service
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/home/raspiled/ft-demos
+ExecStart=/usr/bin/python3 /home/raspiled/ft-demos/matrix_web_controller.py
+Restart=always
+RestartSec=5
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=matrix-web
+
+[Install]
+WantedBy=multi-user.target 
