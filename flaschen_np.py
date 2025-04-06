@@ -14,11 +14,15 @@
 
 import socket
 import numpy as np
+import math
 
 class FlaschenNP(object):
   '''A Framebuffer display interface that sends a frame via UDP.
 
   JBY: modified to use numpy as storage backend.'''
+
+  # Maximum UDP packet size (safe value)
+  MAX_UDP_PACKET = 65507
 
   def __init__(self, host, port, width, height, layer=0, transparent=False):
     '''
@@ -48,6 +52,8 @@ class FlaschenNP(object):
     self._bytedata[-1 * len(footer):] = str.encode(footer)
     self.data = np.zeros((height, width, 3), 'uint8')
     self._header_len = len(header)
+    self._footer_len = len(footer)
+    self._buffer_size = len(self._bytedata)
 
   def set(self, x, y, color):
     '''Set the pixel at the given coordinates to the specified color.
@@ -77,13 +83,60 @@ class FlaschenNP(object):
     self.data[:] = 0
   
   def send(self):
-    '''Send the updated pixels to the display.'''
-    #self._data = bytearray(width * height * 3 + len(header) + len(footer))
-    #self._data[0:len(header)] = header
-    #self._data[-1 * len(footer):] = footer
-
-    self._bytedata[self._header_len:self._header_len + self.data.nbytes] = self.data.tobytes()
-    #bytedata = bytearray(self.width * self.height * 3 + len(self.header) + len(self.footer))
-    #bytedata[0:len(self.header
-    self._sock.send(self._bytedata)
+    '''Send the updated pixels to the display.
+    
+    For large images, this breaks the image into tiles that fit within 
+    the maximum UDP packet size and sends each tile individually with the
+    correct offset.
+    '''
+    # Check if we need to tile the image
+    if self._buffer_size > self.MAX_UDP_PACKET:
+      # Calculate the max tile size that can fit in a UDP packet
+      pixels_per_packet = (self.MAX_UDP_PACKET - self._header_len - self._footer_len) // 3
+      
+      # Calculate optimal tile dimensions
+      tile_height = min(self.height, int(math.sqrt(pixels_per_packet)))
+      tile_width = min(self.width, pixels_per_packet // tile_height)
+      
+      # If we can't fit even one row, reduce height
+      if tile_width < 1:
+        tile_width = 1
+        tile_height = min(self.height, pixels_per_packet)
+      
+      # Send tiles
+      for y_offset in range(0, self.height, tile_height):
+        for x_offset in range(0, self.width, tile_width):
+          # Calculate the current tile dimensions
+          current_tile_width = min(tile_width, self.width - x_offset)
+          current_tile_height = min(tile_height, self.height - y_offset)
+          
+          # Create a header for this tile
+          tile_header = ''.join(["P6\n",
+                               "%d %d\n" % (current_tile_width, current_tile_height),
+                               "255\n"])
+          
+          # Create a footer with the offset
+          tile_footer = ''.join(["%d\n" % x_offset,
+                              "%d\n" % y_offset,
+                              "%d\n" % self.layer])
+          
+          # Create the tile data
+          tile_data = bytearray(current_tile_width * current_tile_height * 3 + len(tile_header) + len(tile_footer))
+          tile_data[0:len(tile_header)] = str.encode(tile_header)
+          tile_data[-1 * len(tile_footer):] = str.encode(tile_footer)
+          
+          # Extract the relevant portion of the image
+          tile_image = self.data[y_offset:y_offset + current_tile_height, 
+                                x_offset:x_offset + current_tile_width, :]
+          
+          # Copy the tile image data into the buffer
+          tile_bytes = tile_image.tobytes()
+          tile_data[len(tile_header):len(tile_header) + len(tile_bytes)] = tile_bytes
+          
+          # Send the tile
+          self._sock.send(tile_data)
+    else:
+      # Send the entire image in one packet
+      self._bytedata[self._header_len:self._header_len + self.data.nbytes] = self.data.tobytes()
+      self._sock.send(self._bytedata)
 
