@@ -35,10 +35,16 @@ SETTINGS_FILE = 'matrix_settings.json'
 matrix_process = None
 animation_paused = False
 stop_event = threading.Event()
-animation_state = "Stopped"  # Initial state tracker: "Running", "Paused", or "Stopped"
+animation_state = "Stopped"  # Initial state tracker: "Running", "Paused", "Stopped", or "Blank"
 current_color = "green"  # Default color will be loaded from settings if available
 custom_text = ""  # No default text, will be loaded from settings
 color_change_event = threading.Event()  # Added to signal color change to animation process
+
+# Scheduling settings
+start_time = "06:30"  # Default start time (6:30 AM)
+end_time = "22:00"    # Default end time (10:00 PM)
+scheduler_thread = None
+scheduler_stop_event = threading.Event()
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -48,14 +54,16 @@ ft = None
 
 # Load settings from file if it exists
 def load_settings():
-    global current_color, custom_text
+    global current_color, custom_text, start_time, end_time
     try:
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, 'r') as f:
                 settings = json.load(f)
                 current_color = settings.get('color', 'green')
                 custom_text = settings.get('text', '')
-                print(f"Loaded settings: color={current_color}, text='{custom_text}'")
+                start_time = settings.get('start_time', '06:30')
+                end_time = settings.get('end_time', '22:00')
+                print(f"Loaded settings: color={current_color}, text='{custom_text}', start_time={start_time}, end_time={end_time}")
     except Exception as e:
         print(f"Error loading settings: {e}")
 
@@ -64,7 +72,9 @@ def save_settings():
     try:
         settings = {
             'color': current_color,
-            'text': custom_text
+            'text': custom_text,
+            'start_time': start_time,
+            'end_time': end_time
         }
         with open(SETTINGS_FILE, 'w') as f:
             json.dump(settings, f)
@@ -221,6 +231,40 @@ HTML_TEMPLATE = """
             background-color: #005500;
             box-shadow: 0 0 10px rgba(0, 255, 0, 0.7);
         }
+        .schedule-options {
+            margin-top: 30px;
+            padding: 15px;
+            background-color: rgba(0, 40, 0, 0.5);
+            border-radius: 10px;
+        }
+        .time-selector {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-top: 10px;
+        }
+        .time-select {
+            padding: 8px;
+            background-color: rgba(0, 60, 0, 0.7);
+            color: #0f0;
+            border: 2px solid #00ff00;
+            border-radius: 5px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+        .time-select:focus {
+            outline: none;
+            box-shadow: 0 0 10px rgba(0, 255, 0, 0.7);
+        }
+        .blank-mode-btn {
+            background-color: #330000;
+            border: 2px solid #ff0000;
+            color: #ff5555;
+        }
+        .blank-mode-btn:hover {
+            background-color: #550000;
+            box-shadow: 0 0 15px rgba(255, 0, 0, 0.7);
+        }
     </style>
 </head>
 <body>
@@ -231,6 +275,7 @@ HTML_TEMPLATE = """
             <button id="startBtn" onclick="controlAnimation('start')">Start Animation</button>
             <button id="pauseBtn" onclick="controlAnimation('pause')" disabled>Pause</button>
             <button id="stopBtn" onclick="controlAnimation('stop')" disabled>Stop</button>
+            <button id="blankBtn" onclick="controlAnimation('blank')" class="blank-mode-btn">Blank Mode</button>
         </div>
         
         <div class="status">
@@ -268,9 +313,80 @@ HTML_TEMPLATE = """
                 </label>
             </div>
         </div>
+        
+        <div class="schedule-options">
+            <div class="section-title">Schedule</div>
+            <div class="time-selector">
+                <div>
+                    <label for="startTime">Start Time:</label><br>
+                    <select id="startTime" class="time-select" onchange="updateSchedule()">
+                        <!-- Will be populated by JavaScript -->
+                    </select>
+                </div>
+                <div>
+                    <label for="endTime">End Time:</label><br>
+                    <select id="endTime" class="time-select" onchange="updateSchedule()">
+                        <!-- Will be populated by JavaScript -->
+                    </select>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
+        // Generate time options for dropdowns (30-minute intervals)
+        function generateTimeOptions() {
+            const startSelect = document.getElementById('startTime');
+            const endSelect = document.getElementById('endTime');
+            
+            // Clear existing options
+            startSelect.innerHTML = '';
+            endSelect.innerHTML = '';
+            
+            // Generate options for each hour and half-hour
+            for (let hour = 0; hour < 24; hour++) {
+                for (let minute of ['00', '30']) {
+                    const timeString = `${hour.toString().padStart(2, '0')}:${minute}`;
+                    const option = document.createElement('option');
+                    option.value = timeString;
+                    option.textContent = timeString;
+                    
+                    // Add to both dropdowns
+                    startSelect.appendChild(option.cloneNode(true));
+                    endSelect.appendChild(option.cloneNode(true));
+                }
+            }
+            
+            // Set initial values from server
+            fetch('/schedule')
+                .then(response => response.json())
+                .then(data => {
+                    startSelect.value = data.start_time;
+                    endSelect.value = data.end_time;
+                });
+        }
+        
+        // Update schedule on server
+        function updateSchedule() {
+            const startTime = document.getElementById('startTime').value;
+            const endTime = document.getElementById('endTime').value;
+            
+            fetch('/schedule', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ 
+                    start_time: startTime,
+                    end_time: endTime
+                }),
+            })
+            .then(response => response.json())
+            .then(data => {
+                console.log("Schedule updated: " + startTime + " to " + endTime);
+            });
+        }
+        
         // Update UI based on current state
         function updateUI(state, text) {
             document.getElementById('status').textContent = state;
@@ -279,14 +395,37 @@ HTML_TEMPLATE = """
                 document.getElementById('startBtn').disabled = true;
                 document.getElementById('pauseBtn').disabled = false;
                 document.getElementById('stopBtn').disabled = false;
+                document.getElementById('blankBtn').disabled = false;
             } else if (state === 'Paused') {
                 document.getElementById('startBtn').disabled = false;
                 document.getElementById('pauseBtn').disabled = true;
                 document.getElementById('stopBtn').disabled = true;
+                document.getElementById('blankBtn').disabled = false;
             } else if (state === 'Stopped') {
                 document.getElementById('startBtn').disabled = false;
                 document.getElementById('pauseBtn').disabled = true;
                 document.getElementById('stopBtn').disabled = true;
+                document.getElementById('blankBtn').disabled = false;
+            } else if (state === 'Blank') {
+                // In blank mode, check if we're in active hours
+                const now = new Date();
+                const currentTime = now.getHours().toString().padStart(2, '0') + ':' + 
+                                   now.getMinutes().toString().padStart(2, '0');
+                
+                // Get the schedule times from the dropdowns
+                const startTime = document.getElementById('startTime').value;
+                const endTime = document.getElementById('endTime').value;
+                
+                // Enable start button if we're in active hours
+                if (startTime <= currentTime && currentTime < endTime) {
+                    document.getElementById('startBtn').disabled = false;
+                } else {
+                    document.getElementById('startBtn').disabled = true;
+                }
+                
+                document.getElementById('pauseBtn').disabled = true;
+                document.getElementById('stopBtn').disabled = true;
+                document.getElementById('blankBtn').disabled = true;
             }
             
             // Update the text input field if provided
@@ -304,6 +443,9 @@ HTML_TEMPLATE = """
                     // Set the color radio button based on server state
                     document.querySelector(`input[name="color"][value="${data.color}"]`).checked = true;
                 });
+                
+            // Generate time options for dropdowns
+            generateTimeOptions();
         };
 
         // Control the animation
@@ -317,6 +459,9 @@ HTML_TEMPLATE = """
             })
             .then(response => response.json())
             .then(data => {
+                if (data.error) {
+                    alert(data.error);
+                }
                 updateUI(data.status);
             });
         }
@@ -393,7 +538,11 @@ def draw_text(text, color=(0, 255, 0), layer=None, clear_first=True):
     
     # Simple 5x7 pixel font for uppercase letters and some special characters
     font = {
-        'A': [0x3E, 0x51, 0x51, 0x3E, 0x00],  # Reverted to original pattern
+        'A': [0x3F, 0x48, 0x48, 0x3F, 0x00],  # 00111111
+                                              # 01001000
+                                              # 01001000
+                                              # 00111111
+                                              # 00000000
         'B': [0x7F, 0x49, 0x49, 0x36, 0x00],
         'C': [0x3E, 0x41, 0x41, 0x22, 0x00],
         'D': [0x7F, 0x41, 0x41, 0x3E, 0x00],
@@ -530,6 +679,11 @@ def update_time_display():
             
         # Update the text with the current time
         draw_text(custom_text, color=color_rgb)
+    elif animation_state == "Blank":
+        # In blank mode, ensure the screen stays blank
+        fill_screen((0, 0, 0))
+        fill_screen((0, 0, 0), layer=DISPLAY_TEXT_LAYER)
+        fill_screen((0, 0, 0), layer=QR_CODE_LAYER)
 
 def run_matrix_animation():
     """Run the matrix animation in a separate thread"""
@@ -618,6 +772,17 @@ def run_matrix_animation():
             # Always display welcome text when stopped (but skip if it's the initial startup)
             if not initial_startup:
                 draw_welcome_text()
+        elif animation_state == "Blank":
+            # If in blank mode and process is running, terminate it
+            if matrix_process and matrix_process.poll() is None:
+                matrix_process.terminate()
+                matrix_process.wait()
+                matrix_process = None
+            
+            # Ensure the screen is blank
+            fill_screen((0, 0, 0))
+            fill_screen((0, 0, 0), layer=DISPLAY_TEXT_LAYER)
+            fill_screen((0, 0, 0), layer=QR_CODE_LAYER)
         
         # After first loop, we're no longer in initial startup
         initial_startup = False
@@ -693,6 +858,36 @@ def control_animation():
     global matrix_process, animation_state
     action = request.json.get('action')
     
+    # Handle blank mode action - this should work regardless of schedule
+    if action == 'blank':
+        # Stop any running animation
+        if matrix_process and matrix_process.poll() is None:
+            matrix_process.terminate()
+            matrix_process.wait()
+            matrix_process = None
+        
+        # Set to blank mode
+        animation_state = "Blank"
+        # Clear the display
+        fill_screen((0, 0, 0))
+        fill_screen((0, 0, 0), layer=DISPLAY_TEXT_LAYER)
+        fill_screen((0, 0, 0), layer=QR_CODE_LAYER)
+        return jsonify({"status": animation_state})
+    
+    # Don't allow starting from blank mode unless it's during active hours
+    current_time = time.strftime("%H:%M")
+    if action == 'start' and animation_state == "Blank":
+        if start_time <= current_time < end_time:
+            # During active hours, allow starting from blank mode
+            animation_state = "Running"  # Changed from "Stopped" to "Running" to start animation immediately
+            # Clear the display
+            fill_screen((0, 0, 0))
+            fill_screen((0, 0, 0), layer=DISPLAY_TEXT_LAYER)
+            fill_screen((0, 0, 0), layer=QR_CODE_LAYER)
+        else:
+            # Outside active hours, don't allow starting
+            return jsonify({"status": animation_state, "error": "Cannot start during off hours"})
+    
     if action == 'start':
         if animation_state == "Paused":
             # Resume from pause (send SIGCONT to resume the process)
@@ -709,9 +904,10 @@ def control_animation():
     
     elif action == 'pause':
         if animation_state == "Running":
-            # Pause the animation (send SIGSTOP to freeze the process)
+            # Instead of terminating the process, just send SIGSTOP to freeze it
             if matrix_process and matrix_process.poll() is None:
                 os.kill(matrix_process.pid, signal.SIGSTOP)
+            
             animation_state = "Paused"
     
     elif action == 'stop':
@@ -720,9 +916,19 @@ def control_animation():
             matrix_process.terminate()
             matrix_process.wait()
             matrix_process = None
-        # Always show welcome text when stopped
-        draw_welcome_text()
-        animation_state = "Stopped"
+        
+        # Check if we're in off hours
+        current_time = time.strftime("%H:%M")
+        if start_time <= current_time < end_time:
+            # During active hours, show welcome text
+            draw_welcome_text()
+            animation_state = "Stopped"
+        else:
+            # Outside active hours, go to blank mode
+            fill_screen((0, 0, 0))
+            fill_screen((0, 0, 0), layer=DISPLAY_TEXT_LAYER)
+            fill_screen((0, 0, 0), layer=QR_CODE_LAYER)
+            animation_state = "Blank"
     
     return jsonify({"status": animation_state})
 
@@ -778,6 +984,48 @@ def qrcode_control():
         "success": False,
         "error": "Invalid action"
     })
+
+@app.route('/schedule', methods=['GET', 'POST'])
+def handle_schedule():
+    """Handle schedule settings"""
+    global start_time, end_time
+    
+    if request.method == 'GET':
+        # Return current schedule settings
+        return jsonify({
+            "start_time": start_time,
+            "end_time": end_time
+        })
+    
+    elif request.method == 'POST':
+        # Update schedule settings
+        data = request.json
+        new_start_time = data.get('start_time', start_time)
+        new_end_time = data.get('end_time', end_time)
+        
+        # Validate times
+        try:
+            # Check if times are in correct format (HH:MM)
+            time.strptime(new_start_time, "%H:%M")
+            time.strptime(new_end_time, "%H:%M")
+            
+            # Update settings
+            start_time = new_start_time
+            end_time = new_end_time
+            
+            # Save to file
+            save_settings()
+            
+            return jsonify({
+                "success": True,
+                "start_time": start_time,
+                "end_time": end_time
+            })
+        except ValueError:
+            return jsonify({
+                "success": False,
+                "error": "Invalid time format. Use HH:MM"
+            }), 400
 
 def signal_handler(sig, frame):
     """Handle SIGINT and SIGTERM signals"""
@@ -878,6 +1126,44 @@ def display_qr_code():
     # Return the URL that was encoded
     return url
 
+def run_scheduler():
+    """Run the scheduler to automatically change modes based on time"""
+    global animation_state, scheduler_stop_event
+    
+    while not scheduler_stop_event.is_set():
+        current_time = time.strftime("%H:%M")
+        
+        # Check if current time is between start_time and end_time
+        if start_time <= current_time < end_time:
+            # During active hours, ensure we're not in blank mode
+            if animation_state == "Blank":
+                # If we were in blank mode, go to stopped state
+                animation_state = "Stopped"
+                # Clear the display
+                fill_screen((0, 0, 0))
+                fill_screen((0, 0, 0), layer=DISPLAY_TEXT_LAYER)
+                fill_screen((0, 0, 0), layer=QR_CODE_LAYER)
+                # Show QR code
+                display_qr_code()
+        else:
+            # Outside active hours, ensure we're in blank mode
+            if animation_state != "Blank":
+                # Stop any running animation
+                if matrix_process and matrix_process.poll() is None:
+                    matrix_process.terminate()
+                    matrix_process.wait()
+                    matrix_process = None
+                
+                # Set to blank mode
+                animation_state = "Blank"
+                # Clear the display
+                fill_screen((0, 0, 0))
+                fill_screen((0, 0, 0), layer=DISPLAY_TEXT_LAYER)
+                fill_screen((0, 0, 0), layer=QR_CODE_LAYER)
+        
+        # Check every minute
+        time.sleep(60)
+
 if __name__ == '__main__':
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
@@ -897,29 +1183,37 @@ if __name__ == '__main__':
     fill_screen((0, 0, 0), layer=DISPLAY_TEXT_LAYER)  # Clear text layer
     fill_screen((0, 0, 0), layer=QR_CODE_LAYER)  # Clear QR code layer
     
-    # Display QR code at startup
-    print("Displaying QR code on LED matrix")
-    url = display_qr_code()
-    
-    # No additional welcome text, just display the QR code with IP
-    time.sleep(1)
-    
-    print("QR code displayed.")
-    
-    # Set initial state
-    animation_state = "Stopped"
+    # Check current time to determine initial state
+    current_time = time.strftime("%H:%M")
+    if start_time <= current_time < end_time:
+        # During active hours, show QR code
+        print("Displaying QR code on LED matrix")
+        url = display_qr_code()
+        time.sleep(1)
+        print("QR code displayed.")
+        animation_state = "Stopped"
+    else:
+        # Outside active hours, start in blank mode
+        print("Outside active hours, starting in blank mode")
+        animation_state = "Blank"
     
     # Start animation control thread
     animation_thread = threading.Thread(target=run_matrix_animation)
     animation_thread.daemon = True
     animation_thread.start()
     
-    # Wait a bit more to ensure the thread doesn't immediately overwrite the QR code
+    # Start scheduler thread
+    scheduler_thread = threading.Thread(target=run_scheduler)
+    scheduler_thread.daemon = True
+    scheduler_thread.start()
+    
+    # Wait a bit to ensure threads are running
     time.sleep(0.5)
     
     # Display server info
     print(f"Starting web server at http://192.168.86.56:{PORT}")
     print(f"This server will continue running even if the SSH session ends")
+    print(f"Active hours: {start_time} to {end_time}")
     
     # Run Flask app
     app.run(host=HOST, port=PORT, debug=False, threaded=True) 
